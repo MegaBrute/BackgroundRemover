@@ -1,0 +1,43 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Model files (too large for git)
+*.pt
+*.pth
+*.onnx
+*.safetensors
+
+# IDE / Tools
+.claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temp files
+tmp_*/
+temp_*/
+nul
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test outputs
+*.gif
+*.webm
+*.webp
+!demo.gif
