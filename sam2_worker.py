@@ -99,33 +99,44 @@ def process_video(frame_dir, click_points=None, click_labels=None, click_frame_i
 
     predictor, device = load_predictor(checkpoint_path, config_name)
 
-    # Initialize video state
-    inference_state = predictor.init_state(video_path=frame_dir)
+    # Initialize video state (offload to CPU to avoid GPU OOM)
+    inference_state = predictor.init_state(
+        video_path=frame_dir,
+        offload_video_to_cpu=True,
+        async_loading_frames=True
+    )
 
     # Reset state
     predictor.reset_state(inference_state)
 
     if mask_path and os.path.exists(mask_path):
-        # Convert mask to center point (more reliable than add_new_mask)
+        # Use bounding box from mask - more robust than single point
         mask_img = Image.open(mask_path).convert("L")
         mask_array = np.array(mask_img) > 128  # Binary mask
 
-        # Find center of mass of the mask
         y_coords, x_coords = np.where(mask_array)
         if len(x_coords) > 0:
-            center_x = int(np.mean(x_coords))
-            center_y = int(np.mean(y_coords))
+            # Get bounding box with padding
+            min_x, max_x = int(np.min(x_coords)), int(np.max(x_coords))
+            min_y, max_y = int(np.min(y_coords)), int(np.max(y_coords))
 
-            # Use center as point prompt
-            points = np.array([[center_x, center_y]], dtype=np.float32)
-            labels = np.array([1], dtype=np.int32)
+            width = max_x - min_x
+            height = max_y - min_y
+            pad_x = int(width * 0.05)
+            pad_y = int(height * 0.05)
+
+            box = np.array([
+                max(0, min_x - pad_x),
+                max(0, min_y - pad_y),
+                min(mask_array.shape[1], max_x + pad_x),
+                min(mask_array.shape[0], max_y + pad_y)
+            ], dtype=np.float32)
 
             _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
                 inference_state=inference_state,
                 frame_idx=click_frame_idx,
                 obj_id=1,
-                points=points,
-                labels=labels,
+                box=box,
             )
         else:
             raise RuntimeError("Mask is empty - rembg failed to detect subject")
@@ -157,6 +168,19 @@ def process_video(frame_dir, click_points=None, click_labels=None, click_frame_i
 
 def main():
     """Main worker loop - receives commands via stdin, outputs via stdout."""
+
+    # Load predictor ONCE at startup
+    checkpoint_path, config_name = find_sam2_checkpoint()
+    if checkpoint_path is None:
+        print(json.dumps({"status": "ERROR", "message": "SAM 2 checkpoint not found"}), flush=True)
+        return
+
+    try:
+        predictor, device = load_predictor(checkpoint_path, config_name)
+    except Exception as e:
+        print(json.dumps({"status": "ERROR", "message": f"Failed to load SAM 2: {e}"}), flush=True)
+        return
+
     print("READY", flush=True)
 
     for line in sys.stdin:
@@ -175,28 +199,86 @@ def main():
                 mask_path = cmd.get("mask_path")  # Optional: initial mask from rembg
                 output_dir = cmd["output_dir"]
 
-                # Process video
-                masks = process_video(frame_dir, click_points, click_labels, click_frame_idx, mask_path)
+                # Init state for this video (offload to CPU to avoid GPU OOM)
+                inference_state = predictor.init_state(
+                    video_path=frame_dir,
+                    offload_video_to_cpu=True,
+                    async_loading_frames=True
+                )
+                predictor.reset_state(inference_state)
 
-                # Save masks
-                for frame_idx, mask in masks.items():
+                # Set up prompts
+                if mask_path and os.path.exists(mask_path):
+                    mask_img = Image.open(mask_path).convert("L")
+                    mask_array = np.array(mask_img) > 128
+                    y_coords, x_coords = np.where(mask_array)
+                    if len(x_coords) > 0:
+                        # Use bounding box instead of single point - more robust
+                        min_x, max_x = int(np.min(x_coords)), int(np.max(x_coords))
+                        min_y, max_y = int(np.min(y_coords)), int(np.max(y_coords))
+
+                        # Add some padding (5%)
+                        width = max_x - min_x
+                        height = max_y - min_y
+                        pad_x = int(width * 0.05)
+                        pad_y = int(height * 0.05)
+
+                        box = np.array([
+                            max(0, min_x - pad_x),
+                            max(0, min_y - pad_y),
+                            min(mask_array.shape[1], max_x + pad_x),
+                            min(mask_array.shape[0], max_y + pad_y)
+                        ], dtype=np.float32)
+
+                        predictor.add_new_points_or_box(
+                            inference_state=inference_state,
+                            frame_idx=click_frame_idx,
+                            obj_id=1,
+                            box=box,
+                        )
+                    else:
+                        raise RuntimeError("Mask is empty")
+                elif click_points:
+                    points = np.array(click_points, dtype=np.float32)
+                    labels = np.array(click_labels, dtype=np.int32)
+                    predictor.add_new_points_or_box(
+                        inference_state=inference_state,
+                        frame_idx=click_frame_idx,
+                        obj_id=1,
+                        points=points,
+                        labels=labels,
+                    )
+                else:
+                    raise RuntimeError("No prompts provided")
+
+                # Propagate with progress
+                num_frames = 0
+                for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
+                    mask = (mask_logits[0] > 0.0).cpu().numpy().squeeze()
+
                     # Load original frame
                     frame_path = os.path.join(frame_dir, f"{frame_idx:05d}.jpg")
                     if not os.path.exists(frame_path):
                         frame_path = os.path.join(frame_dir, f"{frame_idx:05d}.png")
 
                     img = Image.open(frame_path).convert("RGBA")
-
-                    # Apply mask as alpha
                     alpha = (mask * 255).astype(np.uint8)
                     alpha_img = Image.fromarray(alpha).resize(img.size, Image.Resampling.LANCZOS)
                     img.putalpha(alpha_img)
 
-                    # Save result
                     out_path = os.path.join(output_dir, f"{frame_idx:05d}.png")
                     img.save(out_path)
+                    num_frames += 1
 
-                print(json.dumps({"status": "OK", "num_frames": len(masks)}), flush=True)
+                    # Report progress per frame
+                    print(json.dumps({"status": "PROGRESS", "frame": frame_idx, "total": num_frames}), flush=True)
+
+                    # Clear GPU memory periodically
+                    del mask_logits
+                    if num_frames % 10 == 0:
+                        torch.cuda.empty_cache()
+
+                print(json.dumps({"status": "OK", "num_frames": num_frames}), flush=True)
 
             elif cmd.get("action") == "check":
                 # Check if SAM 2 is ready

@@ -531,11 +531,13 @@ class SAM2Thread(QThread):
 
 
 class AutoSAM2Thread(QThread):
-    """Thread for Auto + SAM 2 hybrid processing: rembg detects, SAM 2 propagates."""
+    """Thread for Auto + SAM 2 hybrid processing with chunks (bounding box approach)."""
     progress = pyqtSignal(str)  # status message
     frame_done = pyqtSignal(int, object)  # index, result image
     finished_all = pyqtSignal(int)  # num_frames processed
     error_occurred = pyqtSignal(str)
+
+    CHUNK_SIZE = 30  # Process in chunks to avoid GPU OOM
 
     def __init__(self, frames, deleted_frames):
         super().__init__()
@@ -544,29 +546,23 @@ class AutoSAM2Thread(QThread):
 
     def run(self):
         temp_dir = tempfile.mkdtemp(prefix='auto_sam2_')
-        frame_dir = os.path.join(temp_dir, "frames")
-        output_dir = os.path.join(temp_dir, "output")
-        os.makedirs(frame_dir)
-        os.makedirs(output_dir)
 
         try:
-            # Step 1: Save frames
-            self.progress.emit("Saving frames...")
-            for i, frame in enumerate(self.frames):
-                if i not in self.deleted_frames:
-                    frame_path = os.path.join(frame_dir, f"{i:05d}.jpg")
-                    frame.convert("RGB").save(frame_path, "JPEG", quality=95)
+            # Get active frame indices
+            active_indices = [i for i in range(len(self.frames)) if i not in self.deleted_frames]
+            total_frames = len(active_indices)
 
-            # Step 2: Run rembg on first non-deleted frame to get initial mask
-            first_frame_idx = 0
-            for i in range(len(self.frames)):
-                if i not in self.deleted_frames:
-                    first_frame_idx = i
-                    break
+            if total_frames == 0:
+                raise RuntimeError("No frames to process")
 
-            self.progress.emit("Running rembg to detect subject...")
+            # Split into chunks
+            chunks = []
+            for i in range(0, len(active_indices), self.CHUNK_SIZE):
+                chunks.append(active_indices[i:i + self.CHUNK_SIZE])
 
-            # Start rembg worker to process first frame
+            self.progress.emit(f"Processing {total_frames} frames in {len(chunks)} chunk(s)...")
+
+            # Start rembg worker (keep alive for all chunks)
             rembg_script = os.path.join(get_app_dir(), "rembg_only_worker.py")
             rembg_proc = subprocess.Popen(
                 [sys.executable, rembg_script],
@@ -581,89 +577,114 @@ class AutoSAM2Thread(QThread):
             if ready != "READY":
                 raise RuntimeError(f"rembg worker failed: {ready}")
 
-            # Process first frame with rembg
-            input_path = os.path.join(frame_dir, f"{first_frame_idx:05d}.jpg")
-            rembg_output = os.path.join(temp_dir, "rembg_result.png")
-            mask_path = os.path.join(temp_dir, "initial_mask.png")
-
-            cmd = json.dumps({"input": input_path, "output": rembg_output})
-            rembg_proc.stdin.write(cmd + "\n")
-            rembg_proc.stdin.flush()
-
-            result = rembg_proc.stdout.readline().strip()
-            rembg_proc.stdin.write("QUIT\n")
-            rembg_proc.stdin.flush()
-            rembg_proc.terminate()
-
-            if result != "OK":
-                raise RuntimeError(f"rembg failed: {result}")
-
-            # Extract mask from rembg result
-            rembg_img = Image.open(rembg_output).convert("RGBA")
-            mask = rembg_img.split()[3]  # Get alpha channel
-            mask.save(mask_path)
-
-            self.progress.emit("Loading SAM 2 model...")
-
-            # Step 3: Run SAM 2 with the mask
             sam2_script = os.path.join(get_app_dir(), "sam2_worker.py")
-            sam2_proc = subprocess.Popen(
-                [sys.executable, sam2_script],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1
-            )
+            total_processed = 0
 
-            ready = sam2_proc.stdout.readline().strip()
-            if ready != "READY":
-                stderr = sam2_proc.stderr.read()
-                raise RuntimeError(f"SAM 2 worker failed: {ready}\n{stderr}")
+            for chunk_idx, chunk_indices in enumerate(chunks):
+                self.progress.emit(f"Chunk {chunk_idx + 1}/{len(chunks)}: Preparing frames...")
 
-            self.progress.emit("SAM 2 propagating mask through video...")
+                # Create directories for this chunk
+                chunk_frame_dir = os.path.join(temp_dir, f"chunk_{chunk_idx}_frames")
+                chunk_output_dir = os.path.join(temp_dir, f"chunk_{chunk_idx}_output")
+                os.makedirs(chunk_frame_dir, exist_ok=True)
+                os.makedirs(chunk_output_dir, exist_ok=True)
 
-            cmd = {
-                "action": "process",
-                "frame_dir": frame_dir,
-                "mask_path": mask_path,
-                "click_frame_idx": first_frame_idx,
-                "output_dir": output_dir
-            }
+                # Save chunk frames
+                for local_idx, orig_idx in enumerate(chunk_indices):
+                    frame_path = os.path.join(chunk_frame_dir, f"{local_idx:05d}.jpg")
+                    self.frames[orig_idx].convert("RGB").save(frame_path, "JPEG", quality=95)
 
-            sam2_proc.stdin.write(json.dumps(cmd) + "\n")
-            sam2_proc.stdin.flush()
+                # Run rembg on this chunk's first frame
+                self.progress.emit(f"Chunk {chunk_idx + 1}/{len(chunks)}: Detecting subject...")
+                first_frame_path = os.path.join(chunk_frame_dir, "00000.jpg")
+                mask_output = os.path.join(temp_dir, f"chunk_{chunk_idx}_mask.png")
 
-            response_line = sam2_proc.stdout.readline().strip()
+                cmd = json.dumps({"input": first_frame_path, "output": mask_output})
+                rembg_proc.stdin.write(cmd + "\n")
+                rembg_proc.stdin.flush()
 
-            try:
-                sam2_proc.stdin.write("QUIT\n")
+                result = rembg_proc.stdout.readline().strip()
+                if result != "OK":
+                    raise RuntimeError(f"rembg failed on chunk {chunk_idx}")
+
+                # Extract mask
+                rembg_img = Image.open(mask_output).convert("RGBA")
+                mask_array = np.array(rembg_img)[:, :, 3]
+                chunk_mask = Image.fromarray(mask_array)
+                chunk_mask_path = os.path.join(temp_dir, f"chunk_{chunk_idx}_mask_gray.png")
+                chunk_mask.save(chunk_mask_path)
+
+                # Start fresh SAM 2 worker for each chunk (resets GPU memory)
+                self.progress.emit(f"Chunk {chunk_idx + 1}/{len(chunks)}: Starting SAM 2...")
+                sam2_proc = subprocess.Popen(
+                    [sys.executable, sam2_script],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1
+                )
+
+                sam2_ready = sam2_proc.stdout.readline().strip()
+                if sam2_ready != "READY":
+                    raise RuntimeError(f"SAM 2 worker failed: {sam2_ready}")
+
+                # Process chunk using frame 0's mask (bounding box approach)
+                self.progress.emit(f"Chunk {chunk_idx + 1}/{len(chunks)}: SAM 2 propagating...")
+
+                sam2_cmd = json.dumps({
+                    "action": "process",
+                    "frame_dir": chunk_frame_dir,
+                    "mask_path": chunk_mask_path,
+                    "click_frame_idx": 0,
+                    "output_dir": chunk_output_dir
+                })
+                sam2_proc.stdin.write(sam2_cmd + "\n")
                 sam2_proc.stdin.flush()
-                sam2_proc.terminate()
+
+                # Read SAM 2 output
+                while True:
+                    sam2_result = sam2_proc.stdout.readline().strip()
+                    if not sam2_result:
+                        if sam2_proc.poll() is not None:
+                            stderr = sam2_proc.stderr.read()
+                            raise RuntimeError(f"SAM 2 died: {stderr}")
+                        continue
+                    result_data = json.loads(sam2_result)
+
+                    if result_data.get("status") == "PROGRESS":
+                        frame_num = result_data.get("frame", 0)
+                        self.progress.emit(f"Chunk {chunk_idx + 1}/{len(chunks)}: Frame {frame_num + 1}/{len(chunk_indices)}...")
+                    elif result_data.get("status") == "OK":
+                        break
+                    elif result_data.get("status") == "ERROR":
+                        raise RuntimeError(f"SAM 2 error: {result_data.get('message')}")
+
+                # Close SAM 2 worker
+                try:
+                    sam2_proc.stdin.write("QUIT\n")
+                    sam2_proc.stdin.flush()
+                    sam2_proc.terminate()
+                except:
+                    pass
+
+                # Load results
+                for local_idx, orig_idx in enumerate(chunk_indices):
+                    output_path = os.path.join(chunk_output_dir, f"{local_idx:05d}.png")
+                    if os.path.exists(output_path):
+                        result_img = Image.open(output_path).copy()
+                        self.frame_done.emit(orig_idx, result_img)
+                        total_processed += 1
+
+            # Close rembg worker
+            try:
+                rembg_proc.stdin.write("QUIT\n")
+                rembg_proc.stdin.flush()
+                rembg_proc.terminate()
             except:
                 pass
 
-            if not response_line:
-                stderr = sam2_proc.stderr.read()
-                raise RuntimeError(f"No response from SAM 2.\nStderr: {stderr}")
-
-            response = json.loads(response_line)
-            if response.get("status") != "OK":
-                raise RuntimeError(response.get("message", "Unknown error") +
-                                 "\n" + response.get("traceback", ""))
-
-            # Step 4: Load results
-            self.progress.emit("Loading segmented frames...")
-            num_loaded = 0
-
-            for i in range(len(self.frames)):
-                out_path = os.path.join(output_dir, f"{i:05d}.png")
-                if os.path.exists(out_path):
-                    result_img = Image.open(out_path).copy()
-                    self.frame_done.emit(i, result_img)
-                    num_loaded += 1
-
-            self.finished_all.emit(num_loaded)
+            self.finished_all.emit(total_processed)
 
         except Exception as e:
             import traceback
@@ -786,15 +807,17 @@ class DropZone(QLabel):
         super().__init__(parent)
         self.setObjectName("dropZone")
         self.setAlignment(Qt.AlignCenter)
-        self.setText("Drag & Drop GIF Here\n\nor click to browse")
+        self.setText("Drag & Drop GIF or Video\n\nor click to browse")
         self.setAcceptDrops(True)
         self.setCursor(Qt.PointingHandCursor)
         self.setMinimumHeight(200)
 
+    SUPPORTED_FORMATS = ('.gif', '.mp4', '.webm', '.avi', '.mov', '.mkv', '.wmv', '.flv')
+
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
             urls = event.mimeData().urls()
-            if urls and urls[0].toLocalFile().lower().endswith('.gif'):
+            if urls and urls[0].toLocalFile().lower().endswith(self.SUPPORTED_FORMATS):
                 event.acceptProposedAction()
                 self.setStyleSheet(self.styleSheet() + "border-color: #6c5ce7 !important;")
 
@@ -806,13 +829,15 @@ class DropZone(QLabel):
         urls = event.mimeData().urls()
         if urls:
             file_path = urls[0].toLocalFile()
-            if file_path.lower().endswith('.gif'):
+            if file_path.lower().endswith(self.SUPPORTED_FORMATS):
                 self.fileDropped.emit(file_path)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             file_path, _ = QFileDialog.getOpenFileName(
-                self, "Select GIF", "", "GIF files (*.gif);;All files (*.*)"
+                self, "Select Media",
+                "",
+                "Media files (*.gif *.mp4 *.webm *.avi *.mov *.mkv);;GIF files (*.gif);;Video files (*.mp4 *.webm *.avi *.mov *.mkv);;All files (*.*)"
             )
             if file_path:
                 self.fileDropped.emit(file_path)
@@ -1028,16 +1053,16 @@ class GifBackgroundRemover(QMainWindow):
         self.engine_combo = QComboBox()
         self.engine_combo.addItems([
             "Color Key (solid backgrounds - FAST)",
-            "Auto + SAM 2 (AI - fully automatic)",
+            "Auto + SAM 2 (AI hybrid)",
             "SAM 2 (AI - click to segment)",
             "RVM (AI - temporal memory)",
             "rembg (AI - general purpose)"
         ])
         self.engine_combo.setToolTip(
             "Color Key: Instant, perfect for solid color backgrounds\n"
-            "Auto + SAM 2: Fully automatic AI - rembg detects, SAM 2 propagates\n"
+            "Auto + SAM 2: rembg detects subject, SAM 2 propagates (30-frame chunks)\n"
             "SAM 2: Manual click, then propagates to all frames\n"
-            "RVM: Automatic, temporal memory for people\n"
+            "RVM: Automatic, temporal memory for people/video\n"
             "rembg: Automatic, per-frame, good for cartoons"
         )
         self.engine_combo.currentIndexChanged.connect(self.on_engine_changed)
@@ -1468,12 +1493,19 @@ class GifBackgroundRemover(QMainWindow):
 
     def load_gif_dialog(self):
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select GIF", "", "GIF files (*.gif);;All files (*.*)"
+            self, "Select Media",
+            "",
+            "Media files (*.gif *.mp4 *.webm *.avi *.mov *.mkv);;GIF files (*.gif);;Video files (*.mp4 *.webm *.avi *.mov *.mkv);;All files (*.*)"
         )
         if file_path:
-            self.load_gif(file_path)
+            self.load_media(file_path)
 
     def load_gif(self, file_path):
+        """Legacy method - redirects to load_media."""
+        self.load_media(file_path)
+
+    def load_media(self, file_path):
+        """Load GIF or video file."""
         self.gif_path = file_path
         self.original_frames = []
         self.processed_frames = []
@@ -1489,14 +1521,66 @@ class GifBackgroundRemover(QMainWindow):
         self.trim_start = 0
 
         try:
-            gif = Image.open(file_path)
+            ext = os.path.splitext(file_path)[1].lower()
 
-            for frame in ImageSequence.Iterator(gif):
-                frame_rgba = frame.convert("RGBA")
-                self.original_frames.append(frame_rgba.copy())
-                self.processed_frames.append(None)
-                duration = frame.info.get("duration", 100)
-                self.frame_durations.append(duration)
+            if ext == '.gif':
+                # Load GIF with PIL
+                gif = Image.open(file_path)
+                for frame in ImageSequence.Iterator(gif):
+                    frame_rgba = frame.convert("RGBA")
+                    self.original_frames.append(frame_rgba.copy())
+                    self.processed_frames.append(None)
+                    duration = frame.info.get("duration", 100)
+                    self.frame_durations.append(duration)
+            else:
+                # Load video with ffmpeg
+                self.status_label.setText("Extracting frames from video...")
+                QApplication.processEvents()
+
+                # Get video info (fps)
+                probe_cmd = [
+                    "ffprobe", "-v", "error",
+                    "-select_streams", "v:0",
+                    "-show_entries", "stream=r_frame_rate",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    file_path
+                ]
+                try:
+                    result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+                    fps_str = result.stdout.strip()
+                    if '/' in fps_str:
+                        num, den = fps_str.split('/')
+                        fps = float(num) / float(den)
+                    else:
+                        fps = float(fps_str) if fps_str else 30.0
+                except:
+                    fps = 30.0
+
+                frame_duration = int(1000 / fps)  # ms per frame
+
+                # Extract frames to temp directory
+                temp_dir = tempfile.mkdtemp(prefix='video_frames_')
+                extract_cmd = [
+                    "ffmpeg", "-i", file_path,
+                    "-vsync", "0",
+                    os.path.join(temp_dir, "frame_%05d.png")
+                ]
+                subprocess.run(extract_cmd, capture_output=True, timeout=300)
+
+                # Load extracted frames
+                frame_files = sorted([f for f in os.listdir(temp_dir) if f.endswith('.png')])
+                for frame_file in frame_files:
+                    frame_path = os.path.join(temp_dir, frame_file)
+                    frame = Image.open(frame_path).convert("RGBA")
+                    self.original_frames.append(frame.copy())
+                    self.processed_frames.append(None)
+                    self.frame_durations.append(frame_duration)
+
+                # Cleanup temp dir
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+            if not self.original_frames:
+                raise RuntimeError("No frames extracted from file")
 
             self.trim_end = len(self.original_frames) - 1
             self.scrubber.setMaximum(len(self.original_frames) - 1)
@@ -1511,7 +1595,8 @@ class GifBackgroundRemover(QMainWindow):
             self.update_trim_label()
 
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to load GIF: {str(e)}")
+            import traceback
+            QMessageBox.critical(self, "Error", f"Failed to load media: {str(e)}\n\n{traceback.format_exc()}")
 
     def update_thumbnails(self):
         for thumb in self.thumbnails:
@@ -3761,41 +3846,7 @@ class GifBackgroundRemover(QMainWindow):
         return result_img
 
     def run_auto_sam2_hybrid(self):
-        """Run Auto + SAM 2 hybrid: rembg detects subject, SAM 2 propagates."""
-        # Check for SAM 2 checkpoint first
-        checkpoint_found = False
-        checkpoints = [
-            "sam2.1_hiera_large.pt", "sam2.1_hiera_base_plus.pt",
-            "sam2.1_hiera_small.pt", "sam2.1_hiera_tiny.pt",
-            "sam2_hiera_large.pt", "sam2_hiera_base_plus.pt",
-            "sam2_hiera_small.pt", "sam2_hiera_tiny.pt",
-        ]
-
-        for ckpt in checkpoints:
-            if os.path.exists(os.path.join(get_app_dir(), ckpt)):
-                checkpoint_found = True
-                break
-            if os.path.exists(os.path.join(get_app_dir(), "checkpoints", ckpt)):
-                checkpoint_found = True
-                break
-
-        if not checkpoint_found:
-            reply = QMessageBox.question(
-                self, "SAM 2 Checkpoint Not Found",
-                "SAM 2 model checkpoint not found.\n\n"
-                "Would you like to download it automatically?\n\n"
-                "Options:\n"
-                "• Yes = Download sam2.1_hiera_large.pt (~900MB, best quality)\n"
-                "• No = Download sam2.1_hiera_tiny.pt (~150MB, faster)\n"
-                "• Cancel = Don't download",
-                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel
-            )
-            if reply == QMessageBox.Yes:
-                self._download_sam2_checkpoint("large")
-            elif reply == QMessageBox.No:
-                self._download_sam2_checkpoint("tiny")
-            return
-
+        """Run Auto + SAM 2 hybrid processing (30-frame chunks)."""
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.progress_bar.setMaximum(0)  # Indeterminate
